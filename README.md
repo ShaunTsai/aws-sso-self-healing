@@ -182,6 +182,8 @@ The script calls a `send_alert` function when SSO expires. Edit `sso-refresh.sh`
 |------|-------------|
 | `sso-refresh.sh` | The refresh/health-check script |
 | `sso-kill-switch.sh` | Emergency token revocation (run if tokens leaked) |
+| `alert-poller.sh` | GuardDuty finding poller → Telegram/Slack (every 15 min) |
+| `ip-sync.sh` | Auto-update EventBridge rule when public IP changes (every 30 min) |
 | `com.sso-self-healing.plist` | macOS launchd config (every 10 min) |
 | `sso-refresh.service` | Linux systemd service unit |
 | `sso-refresh.timer` | Linux systemd timer (every 10 min) |
@@ -404,6 +406,117 @@ This catches a compromised agent or process trying to read your tokens in real-t
 - Set up CloudWatch alarms for unusual Bedrock/AgentCore usage patterns
 - Consider IP-based conditions in your IAM role's trust policy if your server has a static IP
 - Shorten the permission set session duration (default 1h) to minimize the window after revocation
+
+## Real-Time Leak Alerting (EventBridge + SNS)
+
+GuardDuty batches findings every 15 minutes and needs days to build baselines. For instant detection, use CloudTrail → EventBridge → SNS:
+
+```
+Bedrock API call from non-home IP
+  → CloudTrail event (seconds)
+  → EventBridge rule match
+  → SNS notification
+  → Email / Telegram / Slack
+```
+
+### Setup
+
+1. Create an SNS topic and EventBridge rule:
+
+```bash
+# Create SNS topic
+aws sns create-topic --name sso-leak-alert --region us-east-1 --profile admin
+
+# Subscribe your email
+aws sns subscribe \
+  --topic-arn arn:aws:sns:us-east-1:YOUR_ACCOUNT_ID:sso-leak-alert \
+  --protocol email \
+  --notification-endpoint your@email.com \
+  --region us-east-1 --profile admin
+# Confirm via the email link
+
+# Create EventBridge rule (replace YOUR_HOME_IP)
+aws events put-rule \
+  --name bedrock-unusual-ip-alert \
+  --event-pattern '{
+    "source": ["aws.bedrock"],
+    "detail-type": ["AWS API Call via CloudTrail"],
+    "detail": {
+      "eventSource": ["bedrock.amazonaws.com"],
+      "sourceIPAddress": [{"anything-but": ["YOUR_HOME_IP"]}]
+    }
+  }' \
+  --state ENABLED \
+  --region us-east-1 --profile admin
+
+# Attach SNS as target
+aws events put-targets \
+  --rule bedrock-unusual-ip-alert \
+  --targets '[{"Id":"sns-leak-alert","Arn":"arn:aws:sns:us-east-1:YOUR_ACCOUNT_ID:sso-leak-alert"}]' \
+  --region us-east-1 --profile admin
+```
+
+2. For Telegram alerts, install `alert-poller.sh` — it polls GuardDuty every 15 minutes and forwards HIGH/CRITICAL findings via your notification method.
+
+### Telegram / Slack Integration
+
+The `alert-poller.sh` script checks GuardDuty for new high-severity findings and sends them to your preferred channel. Edit the `send_notification()` function at the top of the script:
+
+```bash
+# Telegram via OpenClaw
+send_notification() { openclaw message send --channel telegram -m "$1"; }
+
+# Slack webhook
+send_notification() { curl -s -X POST "$SLACK_WEBHOOK_URL" -H 'Content-type: application/json' -d "{\"text\": \"$1\"}"; }
+
+# macOS desktop notification
+send_notification() { osascript -e "display notification \"$1\" with title \"GuardDuty Alert\""; }
+```
+
+## Dynamic IP Handling (ip-sync)
+
+If your ISP assigns a dynamic public IP (most residential connections), the EventBridge rule needs to track your current IP. The `ip-sync.sh` script handles this automatically:
+
+```
+Every 30 minutes:
+  1. Check current public IP (via checkip.amazonaws.com)
+  2. Compare with stored IP
+  3. If changed → update EventBridge rule + notify via Telegram
+```
+
+### How Dynamic IPs Work
+
+Your public IP is assigned by your ISP to your router's WAN interface. It doesn't matter if your Mac connects via Wi-Fi or Ethernet — the public IP is the same (it's your router's external address). Dynamic IPs typically change when:
+
+- Your router reboots
+- The ISP's DHCP lease expires (varies: hours to months)
+- ISP maintenance or network changes
+
+Most residential IPs are "sticky dynamic" — they change infrequently but unpredictably.
+
+### Setup
+
+```bash
+mkdir -p ~/.config/sso-self-healing/logs
+curl -o ~/.config/sso-self-healing/ip-sync.sh \
+  https://raw.githubusercontent.com/ShaunTsai/aws-sso-self-healing/main/ip-sync.sh
+chmod +x ~/.config/sso-self-healing/ip-sync.sh
+```
+
+Edit the script and set `PROFILE`, `REGION`, and `RULE_NAME`. Then add to launchd (macOS) or systemd (Linux) to run every 30 minutes.
+
+### Verify
+
+```bash
+# Check current stored IP
+cat ~/.config/sso-self-healing/.current-home-ip
+
+# Check logs
+tail -5 ~/.config/sso-self-healing/logs/ip-sync.log
+
+# Force a check
+~/.config/sso-self-healing/ip-sync.sh
+```
 
 ## License
 
