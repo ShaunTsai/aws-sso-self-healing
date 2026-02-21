@@ -1,0 +1,8 @@
+[Unit]
+Description=AWS SSO Self-Healing Session Refresh
+
+[Service]
+Type=oneshot
+ExecStart=%h/.config/sso-self-healing/sso-refresh.sh
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=HOME=%h
