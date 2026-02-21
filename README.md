@@ -186,6 +186,63 @@ The script calls a `send_alert` function when SSO expires. Edit `sso-refresh.sh`
 | `sso-refresh.timer` | Linux systemd timer (every 10 min) |
 | `check-sso-session.py` | Token expiry checker (optional diagnostic) |
 
+## Security: Pros and Cons
+
+### Pros — No Static API Keys
+
+This approach uses AWS SSO (IAM Identity Center) exclusively. There are **zero long-lived IAM access keys** anywhere:
+
+- No `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` stored on disk
+- No static credentials in environment variables, `.env` files, or config
+- No Keychain / secrets manager needed for AWS credentials
+- All credentials are short-lived OAuth2 tokens managed by the AWS CLI
+- If the machine is compromised, there are no permanent keys to steal — only tokens that expire
+
+Compare this to the traditional approach of storing IAM access keys in `~/.aws/credentials`, which never expire and give persistent access until manually rotated.
+
+### Cons — Tokens Can Still Be Leaked
+
+The OAuth2 tokens stored in `~/.aws/sso/cache/` can be extracted if an attacker gains access to the machine:
+
+| Token | If Leaked | Severity | Lifetime |
+|-------|-----------|----------|----------|
+| `accessToken` | Attacker can call AWS APIs with your role's permissions | Medium | ~1 hour (then useless) |
+| `refreshToken` | Attacker can silently generate new accessTokens without login | High | ~90 days |
+
+**However, the damage is controllable:**
+
+1. **Scoped role:** Use a least-privilege IAM role (e.g., only `bedrock:InvokeModel*`). Even if tokens leak, the attacker can only do what the role allows — no admin access, no infrastructure changes.
+
+2. **Time-limited:** Unlike static IAM keys (which last forever), the refreshToken expires in ~90 days and the accessToken in ~1 hour. The blast window is finite.
+
+3. **Revocable:** You can instantly kill a leaked session from the AWS Console:
+   - IAM Identity Center → Users → [your user] → Active sessions → **Revoke**
+   - Or locally: `aws sso logout` to invalidate cached tokens
+
+4. **No lateral movement:** SSO tokens are scoped to a single role in a single account. They can't be used to assume other roles or access other accounts (unless the role explicitly allows it).
+
+5. **Auditable:** All API calls made with SSO credentials show up in CloudTrail with the SSO user identity, making it easy to detect unauthorized usage.
+
+### If You Suspect a Token Leak
+
+```bash
+# 1. Invalidate local tokens immediately
+aws sso logout
+
+# 2. Go to AWS Console → IAM Identity Center → Users → Active sessions → Revoke all
+
+# 3. Re-login
+aws sso login --profile my-profile
+```
+
+### Best Practices
+
+- Use a **least-privilege role** — only grant the permissions your automation actually needs
+- Keep `~/.aws/sso/cache/` readable only by your user (`chmod 700 ~/.aws/sso/cache`)
+- Monitor CloudTrail for unexpected API calls from your SSO role
+- Set up CloudWatch alarms for unusual Bedrock/AgentCore usage patterns
+- Consider IP-based conditions in your IAM role's trust policy if your server has a static IP
+
 ## License
 
 MIT
