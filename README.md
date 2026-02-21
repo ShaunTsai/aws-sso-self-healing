@@ -2,31 +2,65 @@
 
 A self-healing AWS SSO session for headless Mac servers. A health-check script that accidentally became a keep-alive — the SSO session renews itself forever via the AWS CLI's built-in refresh token mechanism.
 
-## How It Works
+## Agent Prompt (paste this to your AI agent / IDE)
+
+> 請閱讀這份文件，協助我在這台機器上配置 AWS SSO 自動續命（Self-Healing SSO），目標是讓 SSO session 在無人值守的情況下自動保持存活約 90 天，過期時自動發送通知提醒重新登入：
+> https://github.com/ShaunTsai/aws-sso-self-healing
+
+## Why Does This Work? (The Mechanism)
+
+When you `aws sso login`, the AWS CLI stores **two** tokens in `~/.aws/sso/cache/`:
+
+| Token | Type | Lifetime | Purpose |
+|-------|------|----------|---------|
+| `accessToken` | OAuth2 JWT | ~1 hour | Used by CLI to call AWS APIs |
+| `refreshToken` | Opaque | ~90 days | Used to silently get a new accessToken |
+
+The key insight: **every time the AWS CLI makes any API call**, it checks the accessToken first. If it's expired, the CLI silently performs an [OAuth2 refresh token exchange](https://datatracker.ietf.org/doc/html/rfc6749#section-6) — no browser, no human, no output. It sends the refreshToken to the SSO OIDC endpoint and gets back a fresh accessToken. This all happens internally before the actual API call.
+
+So when our cron job runs `aws sts get-caller-identity` every 10 minutes:
 
 ```
-launchd (every 10 min)
-   │
-   ▼
-sso-refresh.sh
-   │  runs: aws sts get-caller-identity --profile <your-profile>
-   ▼
-AWS CLI v2
-   │  "accessToken expired? I have a refreshToken."
-   │  silently renews the accessToken via IAM Identity Center
-   ▼
-Logs "OK" — repeat forever
+┌──────────┐  every 10 min  ┌──────────────┐
+│  launchd ├───────────────►│ sso-refresh.sh│
+└──────────┘                └──────┬───────┘
+                                   │
+                    runs: aws sts get-caller-identity
+                                   │
+                                   ▼
+                          ┌─────────────────┐
+                          │   AWS CLI v2     │
+                          │                 │
+                          │ 1. Read cache   │
+                          │ 2. accessToken  │◄─── expired?
+                          │    expired?     │
+                          │       │         │
+                          │    YES│    NO   │
+                          │       ▼         │
+                          │ 3. Exchange     │
+                          │    refreshToken │──► SSO OIDC endpoint
+                          │    for new      │◄── new accessToken
+                          │    accessToken  │
+                          │       │         │
+                          │ 4. Write new    │
+                          │    token to     │
+                          │    cache file   │
+                          │       │         │
+                          │ 5. Call STS     │──► AWS STS
+                          │    with fresh   │◄── caller identity
+                          │    token        │
+                          └─────────────────┘
+                                   │
+                                   ▼
+                            Logs "OK" ✅
+                          (repeat forever)
 ```
 
-The AWS CLI stores two tokens in `~/.aws/sso/cache/`:
-- `accessToken` — short-lived (1 hour)
-- `refreshToken` — long-lived (~90 days)
+**This is NOT creating new IAM access keys.** It's refreshing an OAuth2 access token — a completely different mechanism. The refreshToken acts like a long-lived "remember me" cookie that lets the CLI get new short-lived tokens without human interaction.
 
-When `aws sts get-caller-identity` runs, the CLI checks the accessToken. If expired, it silently uses the refreshToken to get a new one. Since the cron runs every 10 minutes, the accessToken never stays expired for more than a few minutes.
+**When does it actually die?** When the refreshToken expires (~90 days). At that point, the CLI can't refresh anymore, the STS call fails, and the script sends you an alert to re-login.
 
-The refreshToken itself lasts ~90 days. When it finally expires, the script detects the failure and sends an alert (Telegram, Slack, email — your choice) with a device-code URL for re-authentication.
-
-**Result:** One `aws sso login` gives you ~90 days of unattended SSO access.
+**Result:** One `aws sso login` → ~90 days of unattended SSO access.
 
 ## Prerequisites
 
