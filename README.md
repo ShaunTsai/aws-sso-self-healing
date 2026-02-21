@@ -186,6 +186,91 @@ The script calls a `send_alert` function when SSO expires. Edit `sso-refresh.sh`
 | `sso-refresh.timer` | Linux systemd timer (every 10 min) |
 | `check-sso-session.py` | Token expiry checker (optional diagnostic) |
 
+## Use Case: OpenClaw + AWS Bedrock (Headless AI Agent Server)
+
+This project was originally built to solve a specific security problem with [OpenClaw](https://github.com/openclaw/openclaw) — an open-source AI agent that runs as a daemon on a home server, connecting to AWS Bedrock for model inference.
+
+### The Problem
+
+OpenClaw is an AI agent with full shell access. Security researchers have demonstrated that AI agents can be tricked via prompt injection into reading `~/.aws/credentials` and leaking static IAM access keys:
+
+- [Cisco Blog — AI agents security nightmare](https://blogs.cisco.com/ai/personal-ai-agents-like-openclaw-are-a-security-nightmare)
+- [Cyera Research — OpenClaw security saga](https://www.cyera.com/research-labs/the-openclaw-security-saga-how-ai-adoption-outpaced-security-boundaries)
+
+If you store static IAM keys (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) on the same machine as OpenClaw, a prompt injection attack could exfiltrate those keys. Static keys never expire — the attacker has permanent access until you manually rotate them.
+
+### The Solution
+
+Replace static IAM keys with AWS SSO + self-healing refresh:
+
+1. **No static keys on disk** — SSO uses short-lived OAuth2 tokens, not permanent IAM credentials
+2. **Scoped role** — The SSO role only has `bedrock:InvokeModel*` permissions (no admin, no S3, no EC2)
+3. **Auto-expiring** — Even if tokens are leaked, the accessToken dies in 1 hour and the refreshToken in ~90 days
+4. **Self-healing** — The cron job keeps the session alive so the agent never loses Bedrock access
+5. **Revocable** — You can kill all sessions instantly from the AWS Console
+
+### How OpenClaw Uses It
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Mac Home Server                                             │
+│                                                              │
+│  ┌─────────────┐     ┌──────────────────┐                    │
+│  │  OpenClaw    │     │  launchd cron    │                    │
+│  │  Gateway     │     │  (every 10 min)  │                    │
+│  │             │     │        │         │                    │
+│  │  AWS_PROFILE │     │        ▼         │                    │
+│  │  =bedrock-   │     │  sso-refresh.sh  │                    │
+│  │   only       │     │  (health-check   │                    │
+│  │             │     │   = keep-alive)  │                    │
+│  └──────┬──────┘     └────────┬─────────┘                    │
+│         │                     │                              │
+│         │  ~/.aws/sso/cache/  │                              │
+│         │  (OAuth2 tokens)    │                              │
+│         └─────────┬───────────┘                              │
+│                   │                                          │
+└───────────────────┼──────────────────────────────────────────┘
+                    │
+                    ▼
+          AWS Bedrock (us-east-1)
+          └─ InvokeModel (Qwen, Claude, etc.)
+```
+
+The OpenClaw gateway's `start-gateway.sh` sets `AWS_PROFILE=bedrock-only`, which tells the AWS CLI to use SSO credentials. The self-healing cron runs alongside the gateway, ensuring the SSO session never expires while the server is running.
+
+### OpenClaw Configuration
+
+In `~/.openclaw/openclaw.json`, configure Bedrock as the model provider:
+
+```json
+{
+  "models": {
+    "providers": {
+      "bedrock": {
+        "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+        "api": "bedrock-converse-stream",
+        "models": [
+          {
+            "id": "your-model-id",
+            "name": "Your Model Name"
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+In the gateway start script, export the SSO profile:
+
+```bash
+#!/bin/bash
+export AWS_PROFILE=bedrock-only
+exec openclaw gateway start
+```
+
+No `AWS_ACCESS_KEY_ID`. No `AWS_SECRET_ACCESS_KEY`. Just SSO.
+
 ## Security: Pros and Cons
 
 ### Pros — No Static API Keys
