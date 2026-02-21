@@ -181,6 +181,7 @@ The script calls a `send_alert` function when SSO expires. Edit `sso-refresh.sh`
 | File | Description |
 |------|-------------|
 | `sso-refresh.sh` | The refresh/health-check script |
+| `sso-kill-switch.sh` | Emergency token revocation (run if tokens leaked) |
 | `com.sso-self-healing.plist` | macOS launchd config (every 10 min) |
 | `sso-refresh.service` | Linux systemd service unit |
 | `sso-refresh.timer` | Linux systemd timer (every 10 min) |
@@ -308,25 +309,101 @@ The OAuth2 tokens stored in `~/.aws/sso/cache/` can be extracted if an attacker 
 
 5. **Auditable:** All API calls made with SSO credentials show up in CloudTrail with the SSO user identity, making it easy to detect unauthorized usage.
 
-### If You Suspect a Token Leak
+### If You Suspect a Token Leak — Kill Switch
+
+Use the included `sso-kill-switch.sh` for immediate emergency revocation:
 
 ```bash
-# 1. Invalidate local tokens immediately
-aws sso logout
-
-# 2. Go to AWS Console → IAM Identity Center → Users → Active sessions → Revoke all
-
-# 3. Re-login
-aws sso login --profile my-profile
+# Download and run
+curl -o /tmp/sso-kill-switch.sh \
+  https://raw.githubusercontent.com/ShaunTsai/aws-sso-self-healing/main/sso-kill-switch.sh
+chmod +x /tmp/sso-kill-switch.sh
+/tmp/sso-kill-switch.sh my-profile
 ```
+
+The kill switch does 5 things in order:
+
+1. **Stops the self-healing cron** — prevents the refresh loop from re-activating the session
+2. **Calls `aws sso logout`** — invalidates the server-side SSO session
+3. **Deletes local token cache** — removes all `~/.aws/sso/cache/*.json` files
+4. **Verifies the session is dead** — confirms STS calls fail
+5. **Prints manual steps** — for revoking active IAM role sessions in the console
+
+> **Important:** Even after killing the SSO session, any IAM role sessions that were already created (via STS AssumeRole) will persist until the permission set's session duration expires (default: 1 hour). To kill those too, you must revoke active sessions in the IAM Identity Center console.
+
+### Proactive Leak Detection
+
+You don't have to wait until you notice a leak. AWS offers several services that can detect compromised credentials automatically:
+
+#### Option 1: Amazon GuardDuty (recommended — easiest)
+
+GuardDuty monitors CloudTrail logs and detects anomalous credential usage automatically. Relevant finding types:
+
+| Finding | What It Detects |
+|---------|-----------------|
+| `AttackSequence:IAM/CompromisedCredentials` | Sequence of suspicious API calls using potentially compromised credentials |
+| `UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B` | Successful console login from unusual location |
+| `Discovery:IAMUser/AnomalousBehavior` | API calls that deviate from the user's established baseline |
+
+Enable it:
+```bash
+aws guardduty create-detector --enable --profile admin
+```
+
+GuardDuty sends findings to EventBridge, so you can route alerts to SNS → email/Slack/Telegram.
+
+#### Option 2: CloudTrail + EventBridge (DIY — IP-based)
+
+Create an EventBridge rule that fires when Bedrock API calls come from an IP that isn't your home server:
+
+```json
+{
+  "source": ["aws.bedrock"],
+  "detail-type": ["AWS API Call via CloudTrail"],
+  "detail": {
+    "eventSource": ["bedrock.amazonaws.com"],
+    "sourceIPAddress": [{ "anything-but": ["YOUR_HOME_IP"] }]
+  }
+}
+```
+
+Route this to an SNS topic → Telegram/Slack/email. Any Bedrock call from a non-home IP triggers an alert.
+
+#### Option 3: CloudTrail Insights (anomaly detection)
+
+CloudTrail Insights automatically detects unusual API call volume. If someone starts hammering InvokeModel with your leaked tokens, Insights will flag the spike:
+
+```bash
+# Enable Insights on your trail
+aws cloudtrail put-insight-selectors \
+  --trail-name my-trail \
+  --insight-selectors '[{"InsightType": "ApiCallRateInsight"}, {"InsightType": "ApiErrorRateInsight"}]' \
+  --profile admin
+```
+
+#### Option 4: Local file integrity monitoring
+
+Monitor the SSO cache files for unexpected reads by other processes:
+
+```bash
+# macOS: use OpenBSM audit or fs_usage
+sudo fs_usage -f filesys | grep sso/cache
+
+# Linux: use inotifywait
+inotifywait -m -r ~/.aws/sso/cache/ -e access
+```
+
+This catches a compromised agent or process trying to read your tokens in real-time.
 
 ### Best Practices
 
 - Use a **least-privilege role** — only grant the permissions your automation actually needs
 - Keep `~/.aws/sso/cache/` readable only by your user (`chmod 700 ~/.aws/sso/cache`)
+- **Enable GuardDuty** — it's the lowest-effort way to detect compromised credentials
 - Monitor CloudTrail for unexpected API calls from your SSO role
 - Set up CloudWatch alarms for unusual Bedrock/AgentCore usage patterns
 - Consider IP-based conditions in your IAM role's trust policy if your server has a static IP
+- Shorten the permission set session duration (default 1h) to minimize the window after revocation
 
 ## License
 
