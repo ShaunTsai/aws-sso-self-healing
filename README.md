@@ -91,8 +91,20 @@ region = us-east-1
 ### 2. Login Once
 
 ```bash
+# If you have a browser on the machine:
 aws sso login --profile my-profile
+
+# If headless / remote (no browser) — use device-code flow:
+aws sso login --profile my-profile --use-device-code --no-browser
 ```
+
+The `--use-device-code` flag uses the [OAuth 2.0 Device Authorization Grant](https://datatracker.ietf.org/doc/html/rfc8628) instead of the default PKCE flow. This prints a URL like:
+
+```
+https://your-sso.awsapps.com/start/#/device?user_code=ABCD-EFGH
+```
+
+You can open this URL on **any device** (phone, tablet, another computer) to complete the login. See [Remote Login from Phone](#remote-login-from-phone-device-code-flow) for the full workflow.
 
 This creates both the accessToken and refreshToken in `~/.aws/sso/cache/`.
 
@@ -175,6 +187,85 @@ The script calls a `send_alert` function when SSO expires. Edit `sso-refresh.sh`
 - Email via `sendmail` / `msmtp`
 - Any HTTP webhook
 - Desktop notification (`osascript` on macOS, `notify-send` on Linux)
+
+## Remote Login from Phone (Device Code Flow)
+
+When the SSO refresh token expires (~90 days), you need to re-authenticate. On a headless server with no monitor, you can't open a browser locally. The `--use-device-code` flag solves this.
+
+### How It Works
+
+The default `aws sso login` uses PKCE (Proof Key for Code Exchange), which redirects to `http://localhost:PORT/...` — this only works if you have a browser on the same machine. The `--use-device-code` flag switches to the [Device Authorization Grant (RFC 8628)](https://datatracker.ietf.org/doc/html/rfc8628), which generates a URL that works from **any device on any network**.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Headless Mac Server                                            │
+│                                                                 │
+│  sso-refresh.sh detects expired token                           │
+│       │                                                         │
+│       ▼                                                         │
+│  aws sso login --use-device-code --no-browser                   │
+│       │                                                         │
+│       ▼                                                         │
+│  Prints: https://your-sso.awsapps.com/start/#/device?user_code=XXXX │
+│       │                                                         │
+│       ▼                                                         │
+│  Sends URL to Telegram / Slack / email                          │
+└───────────────────────┬─────────────────────────────────────────┘
+                        │
+                        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Your Phone (anywhere in the world)                             │
+│                                                                 │
+│  1. Receive notification with URL                               │
+│  2. Long-press URL → Open in Safari/Chrome                      │
+│  3. Browser auto-fills saved SSO password (Face ID / Touch ID)  │
+│  4. Tap "Approve"                                               │
+│  5. Done — SSO session renewed on the server                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### PKCE vs Device Code
+
+| | PKCE (default) | Device Code (`--use-device-code`) |
+|---|---|---|
+| Redirect URL | `http://localhost:PORT/...` | `https://sso.awsapps.com/start/#/device?user_code=XXXX` |
+| Requires local browser | Yes | No |
+| Works from phone | No | Yes |
+| Works remotely | No | Yes |
+| AWS CLI flag | (none) | `--use-device-code --no-browser` |
+| OAuth2 spec | [RFC 7636](https://datatracker.ietf.org/doc/html/rfc7636) | [RFC 8628](https://datatracker.ietf.org/doc/html/rfc8628) |
+
+### Phone Setup (iOS / Android)
+
+For the smoothest experience, save your SSO credentials in your phone's password manager:
+
+1. Open `https://your-sso.awsapps.com/start` in Safari (iOS) or Chrome (Android) on your phone
+2. Log in manually once and save the password when prompted
+3. Enable Face ID / Touch ID for autofill in Settings → Passwords
+
+Now when you receive a device-code URL via Telegram:
+1. Long-press the URL → "Open in Safari"
+2. Face ID auto-fills your SSO credentials
+3. Tap "Allow" to approve the device
+4. The server's SSO session is renewed — no need to touch the server
+
+### sso-refresh.sh Integration
+
+The included `sso-refresh.sh` already handles this automatically. When the SSO session expires:
+
+1. The script detects the failure via `aws sts get-caller-identity`
+2. Runs `aws sso login --profile PROFILE --use-device-code --no-browser`
+3. Extracts the device URL (the one with `user_code=` parameter)
+4. Sends it via your configured alert method (Telegram, Slack, etc.)
+5. Waits for you to approve on your phone
+
+Customize the `send_alert()` function in `sso-refresh.sh` for your notification method.
+
+### Requirements
+
+- AWS CLI v2.22.0+ (device code flow support)
+- `--no-browser` flag prevents the CLI from trying to open a local browser
+- Your SSO IdP must support the device authorization grant (AWS IAM Identity Center does by default)
 
 ## Files
 
