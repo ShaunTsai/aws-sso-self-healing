@@ -21,40 +21,80 @@ The key insight: **every time the AWS CLI makes any API call**, it checks the ac
 So when our cron job runs `aws sts get-caller-identity` every 10 minutes:
 
 ```
-┌──────────┐  every 10 min  ┌──────────────┐
-│  launchd ├───────────────►│ sso-refresh.sh│
-└──────────┘                └──────┬───────┘
-                                   │
-                    runs: aws sts get-caller-identity
-                                   │
-                                   ▼
-                          ┌─────────────────┐
-                          │   AWS CLI v2     │
-                          │                 │
-                          │ 1. Read cache   │
-                          │ 2. accessToken  │◄─── expired?
-                          │    expired?     │
-                          │       │         │
-                          │    YES│    NO   │
-                          │       ▼         │
-                          │ 3. Exchange     │
-                          │    refreshToken │──► SSO OIDC endpoint
-                          │    for new      │◄── new accessToken
-                          │    accessToken  │
-                          │       │         │
-                          │ 4. Write new    │
-                          │    token to     │
-                          │    cache file   │
-                          │       │         │
-                          │ 5. Call STS     │──► AWS STS
-                          │    with fresh   │◄── caller identity
-                          │    token        │
-                          └─────────────────┘
-                                   │
-                                   ▼
-                            Logs "OK" ✅
-                          (repeat forever)
+┌─────────────────────────────────────────────────────────────────────┐
+│  launchd / systemd (every 10 min)                                   │
+│  sso-refresh.sh                                                     │
+└──────────────────────┬──────────────────────────────────────────────┘
+                       │
+                       ▼
+              ┌─────────────────┐
+              │ Lock file exist? │
+              │ Process alive?   │
+              └────┬────────┬───┘
+                   │YES     │NO
+                   ▼        ▼
+              ┌────────┐  ┌──────────────────────────────┐
+              │ SKIP   │  │ aws sts get-caller-identity   │
+              │ exit 0 │  │ --profile my-profile          │
+              └────────┘  └──────────┬───────────────────┘
+                                     │
+                          ┌──────────┴──────────┐
+                          │                     │
+                        SUCCESS               FAIL
+                          │                     │
+                          ▼                     ▼
+                    ┌──────────┐    ┌────────────────────┐
+                    │ log "OK" │    │ Token expired?      │
+                    │ exit 0   │    └───┬────────────┬───┘
+                    └──────────┘        │YES         │NO
+                                        ▼            ▼
+                    ┌───────────────────────┐  ┌──────────────┐
+                    │ aws sso login         │  │ log ERROR    │
+                    │ --use-device-code     │  │ exit 1       │
+                    │ --no-browser          │  └──────────────┘
+                    │ (BACKGROUND, polling) │
+                    └───────────┬───────────┘
+                                │
+                         ┌──────┴──────┐
+                         │ Write lock  │
+                         │ Sleep 5s    │
+                         │ Extract URL │
+                         └──────┬──────┘
+                                │
+                                ▼
+                    ┌───────────────────────┐
+                    │ Alert → phone/Slack   │
+                    │ 🔑 Approve from phone │
+                    │ https://...?user_code │
+                    └───────────┬───────────┘
+                                │
+                                │  (background process keeps polling)
+                                │
+                    ┌───────────┴───────────┐
+                    │                       │
+                 APPROVED              TIMEOUT/FAIL
+                    │                       │
+                    ▼                       ▼
+          ┌──────────────────┐   ┌────────────────────┐
+          │ Tokens written   │   │ Lock removed        │
+          │ to ~/.aws/sso/   │   │ Next cron run will  │
+          │ cache/           │   │ retry fresh         │
+          │                  │   └────────────────────┘
+          │ Alert:           │
+          │ ✅ SSO renewed   │
+          │                  │
+          │ Remove lock      │
+          └──────────────────┘
+                    │
+                    │  (next cron run, 10 min later)
+                    ▼
+          ┌──────────────────┐
+          │ STS probe → OK   │  ← silent refresh via refreshToken
+          │ log "OK"         │    (repeats for ~90 days)
+          └──────────────────┘
 ```
+
+99% of runs just hit the "OK" path — the STS probe triggers the AWS CLI's internal refresh token exchange silently. You only see an alert when the refresh token dies (~every 90 days).
 
 **This is NOT creating new IAM access keys.** It's refreshing an OAuth2 access token — a completely different mechanism. The refreshToken acts like a long-lived "remember me" cookie that lets the CLI get new short-lived tokens without human interaction.
 
@@ -182,11 +222,24 @@ The self-healing loop keeps the accessToken alive indefinitely. You only need to
 
 The script calls a `send_alert` function when SSO expires. Edit `sso-refresh.sh` to use your preferred notification method:
 
+- OpenClaw Telegram (`openclaw message send`)
 - Telegram bot API
 - Slack webhook
 - Email via `sendmail` / `msmtp`
 - Any HTTP webhook
 - Desktop notification (`osascript` on macOS, `notify-send` on Linux)
+
+### Background Polling (Critical Design Decision)
+
+When the refresh token expires, the script starts `aws sso login --use-device-code --no-browser` as a **background process**. This is critical because:
+
+1. The device-code flow prints a URL, then **polls** the SSO OIDC endpoint every few seconds waiting for user approval
+2. If the process is killed (e.g., by a timeout), the polling stops and the approval URL becomes a dead link
+3. The background process keeps polling for up to ~10 minutes (aligned with the cron interval)
+4. A **lock file** prevents the next cron run from starting a duplicate login flow
+5. Once approved, the background process writes tokens to cache and sends a success alert
+
+Previous versions of this script used a timeout that killed the login process after 20 seconds — this caused the script to spam a new (dead) URL every 10 minutes because the approval never completed.
 
 ## Remote Login from Phone (Device Code Flow)
 
